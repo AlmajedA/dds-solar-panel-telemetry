@@ -11,8 +11,12 @@ log = logging.getLogger("broker")
 _lock        = threading.Lock()
 _subscribers = {}          # id → queue.Queue
 _next_id     = 0
-_stats       = {"received": 0, "forwarded": 0}
-
+_stats = {
+    "received": 0, 
+    "forwarded": 0,
+    "queue_full_drops": 0,      
+    "subscriber_errors": 0       
+}
 
 def _add_sub():
     global _next_id
@@ -39,7 +43,7 @@ def _fanout(msg):
             _stats["forwarded"] += 1
         except queue.Full:
             log.warning("Subscriber %d queue full — message dropped", sid)
-
+            _stats["queue_full_drops"] += 1
 
 # ── Connection handlers ────────────────────────────────────────────────────
 
@@ -52,8 +56,9 @@ def handle_publisher(sock, addr):
                 send_msg(sock, {"type": "PONG"})
             elif msg.get("type") == "TELEMETRY":
                 _fanout(msg)
-    except (ConnectionError, OSError) as e:
-        log.info("Publisher %s gone: %s", addr, e)
+    except ValueError as e:
+        log.error("Protocol error in publisher %s: %s", addr, e)
+        _stats["subscriber_errors"] += 1
     finally:
         sock.close()
 
@@ -75,12 +80,18 @@ def handle_subscriber(sock, addr):
             try:
                 out = q.get(timeout=5)
             except queue.Empty:
-                send_msg(sock, {"type": "PING"})   # keep-alive
+                try:
+                    send_msg(sock, {"type": "PING"})   # keep-alive
+                except (BrokenPipeError, OSError):
+                    log.info("Subscriber #%d disconnected (broken pipe)", sid)
+                    break
                 continue
-            send_msg(sock, out, compress=True)
-
+            send_msg(sock, out, compress=False) # why recompress in broker?
     except (ConnectionError, OSError) as e:
         log.info("Subscriber #%d gone: %s", sid, e)
+    except ValueError as e:
+        log.error("Protocol error in subscriber #%d: %s", sid, e)
+        _stats["subscriber_errors"] += 1
     finally:
         if sid is not None:
             _remove_sub(sid)
@@ -103,9 +114,15 @@ def stats_loop(interval=10):
         time.sleep(interval)
         with _lock:
             n = len(_subscribers)
-        log.info("received=%d  forwarded=%d  subscribers=%d",
-                 _stats["received"], _stats["forwarded"], n)
-
+        log.info(
+            "stats - received=%d forwarded=%d subscribers=%d "
+            "queue_drops=%d errors=%d",
+            _stats["received"],
+            _stats["forwarded"],
+            n,
+            _stats["queue_full_drops"],
+            _stats["subscriber_errors"]
+        )
 
 # ── Main ───────────────────────────────────────────────────────────────────
 
@@ -113,7 +130,7 @@ def main():
     ap = argparse.ArgumentParser(description="Solar fleet broker")
     ap.add_argument("--pub-port", type=int, default=9000)
     ap.add_argument("--sub-port", type=int, default=9001)
-    ap.add_argument("--host",     default="0.0.0.0")
+    ap.add_argument("--host",     default="127.0.0.1")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO,
