@@ -29,6 +29,11 @@ class Stats:
         self.latest   = {}         # panel_id → last message
         self._since   = time.time()
         self._window  = 0
+        self.errors = {            
+            "protocol": 0,
+            "json": 0,
+            "network": 0
+        }
 
     def record(self, msg):
         with self._lock:
@@ -47,23 +52,41 @@ class Stats:
             live_kw  = sum(m.get("power_w", 0) for m in self.latest.values()) / 1000.0
             faults   = sum(1 for m in self.latest.values() if m.get("status") != "OK")
             strings  = {m.get("string_id") for m in self.latest.values()}
-
+            errors_total = sum(self.errors.values()) 
+            
         return (f"panels={n_panels}  strings={len(strings)}  "
                 f"power={live_kw:.2f}kW  faults={faults}  "
-                f"rate={rate:.1f}msg/s  total={self.total}")
+                f"rate={rate:.1f}msg/s  total={self.total}  "
+                f"errors={errors_total}")
+        
+        
+        
+    def record_error(self, error_type):
+        """Record an error."""
+        with self._lock:
+            if error_type in self.errors:
+                self.errors[error_type] += 1
 
 
 # ── Broker connection ──────────────────────────────────────────────────────
 
-def connect(host, port):
-    while True:
+def connect(host, port, retries=9999, delay=3.0):
+    """Connect to broker with exponential backoff."""
+    for attempt in range(1, min(retries + 1, 1000)):
         try:
             s = socket.create_connection((host, port), timeout=5)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            log.info("Connected to broker %s:%d", host, port)
             return s
         except OSError as e:
-            log.warning("Cannot reach broker: %s — retrying in 3s", e)
-            time.sleep(3)
+            #  backoff: 3s, 6s, 12s.. (capped at 60s)
+            backoff = min(delay * (2 ** min(attempt - 1, 4)), 60.0)
+            log.warning(
+                "Broker unreachable (attempt %d): %s — retry in %.0fs",
+                attempt, e, backoff
+            )
+            time.sleep(backoff)
+    raise ConnectionError("Could not reach broker")
 
 
 # ── Main collect loop ──────────────────────────────────────────────────────
@@ -76,26 +99,56 @@ def collect(args, stats: Stats):
 
             # Subscribe handshake
             send_msg(sock, {"type": "SUBSCRIBE", "topic": "telemetry"})
-            ack = recv_msg(sock)
+            
+            # ValueError Handling in Handshake
+            try:
+                ack = recv_msg(sock)
+            except ValueError as e:
+                log.error("Protocol error during SUBSCRIBE handshake: %s", e)
+                stats.record_error("protocol")
+                if sock:
+                    sock.close()
+                time.sleep(5)
+                continue
+            
             sid = ack.get("subscriber_id", "?")
             log.info("Subscribed as #%s to broker %s:%d → writing to %s",
                      sid, args.broker_host, args.broker_port, args.out)
 
             with open(args.out, "a") as f:
                 while True:
-                    msg = recv_msg(sock)
+                    try:
+                        msg = recv_msg(sock)
+                    except ValueError as e:
+                        log.error("Protocol error in message receive: %s", e)
+                        stats.record_error("protocol")
+                        break  # Reconnect
+                    except ConnectionError as e:
+                        log.error("Connection error: %s", e)
+                        stats.record_error("network")
+                        break  # Reconnect
 
+                    # Handle PING/PONG keep-alive
                     if msg.get("type") == "PING":
-                        send_msg(sock, {"type": "PONG"})
+                        try:
+                            send_msg(sock, {"type": "PONG"})
+                        except OSError:
+                            break
                         continue
 
+                    # Skip non-telemetry messages
                     if msg.get("type") != "TELEMETRY":
                         continue
 
                     # Persist and track
-                    f.write(json.dumps(msg) + "\n")
-                    f.flush()
-                    stats.record(msg)
+                    try:
+                        f.write(json.dumps(msg) + "\n")
+                        f.flush()
+                        stats.record(msg)
+                    except (IOError, OSError) as e:
+                        log.error("Error writing to file: %s", e)
+                        stats.record_error("network")
+                        break
 
         except (ConnectionError, OSError) as e:
             log.warning("Disconnected: %s — reconnecting in 5s", e)
